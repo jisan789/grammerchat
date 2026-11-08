@@ -25,51 +25,50 @@ def get_http_client() -> httpx.Client:
     return _httpx_client
 
 
-def _php_call(params: Dict[str, Any], method: str = "POST", timeout: float = 15.0) -> Optional[Dict[str, Any]]:
-    if not PHP_STORAGE_URL:
+def _execute_http(url: str, params: Dict[str, Any], method: str = "POST", timeout: float = 15.0) -> Optional[Dict[str, Any]]:
+    if not url:
         return None
-
     client = get_http_client()
     method_upper = method.upper()
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             if method_upper == "POST":
-                resp = client.post(PHP_STORAGE_URL, json=params, timeout=timeout)
+                resp = client.post(url, json=params, timeout=timeout)
             else:
-                resp = client.get(PHP_STORAGE_URL, params=params, timeout=timeout)
+                resp = client.get(url, params=params, timeout=timeout)
+
+            # Parse and return JSON payload if available (including 400/401/409 error messages from PHP)
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
 
             if resp.status_code == 200:
-                try:
-                    return resp.json()
-                except Exception as json_err:
-                    logger.warning(f"[CRUD] Failed to decode JSON from PHP (status {resp.status_code}): {resp.text[:120]} ({json_err})")
-                    return None
+                break
             else:
-                logger.warning(f"[CRUD] PHP responded with HTTP {resp.status_code} (attempt {attempt + 1}/3)")
+                logger.warning(f"[CRUD] {url} responded with HTTP {resp.status_code} (attempt {attempt + 1}/2): {resp.text[:100]}")
         except (httpx.RequestError, httpx.TimeoutException) as exc:
-            logger.warning(f"[CRUD] Network error calling PHP backend ({attempt + 1}/3): {exc}")
-            if attempt < 2:
+            logger.warning(f"[CRUD] Network error calling {url} ({attempt + 1}/2): {exc}")
+            if attempt < 1:
                 time.sleep(0.15 * (attempt + 1))
         except Exception as e:
-            logger.error(f"[CRUD] Unexpected error contacting PHP storage: {e}")
+            logger.error(f"[CRUD] Unexpected error contacting {url}: {e}")
             break
 
     return None
 
 
-# ─────────────────────────────────────────────────────────────
-# In-Memory Fast Caching & Message Resilience Buffer
-# ─────────────────────────────────────────────────────────────
-# 1. Session verification cache: {token: (user_dict, timestamp)}
-_SESSION_CACHE: Dict[str, Tuple[Dict[str, Any], float]] = {}
-SESSION_CACHE_TTL = 300.0  # 5 minutes
+def _php_call(params: Dict[str, Any], method: str = "POST", timeout: float = 15.0) -> Optional[Dict[str, Any]]:
+    return _execute_http(PHP_STORAGE_URL, params=params, method=method, timeout=timeout)
 
-# 2. Presence last-seen cache: {username: (last_seen_str, timestamp)}
-_PRESENCE_CACHE: Dict[str, Tuple[str, float]] = {}
-PRESENCE_CACHE_TTL = 90.0  # 90 seconds
 
-# 3. Recent messages buffer to guarantee zero message loss during race conditions
+# ─────────────────────────────────────────────────────────────
+# Message Resilience Buffer (Stateless DB-First Mode)
+# ─────────────────────────────────────────────────────────────
+# Recent messages buffer to guarantee zero message loss during race conditions
 # key: "user_a:user_b" (sorted alphabetically), value: list of recent message dicts
 _RECENT_MESSAGES_BUFFER: Dict[str, List[Dict[str, Any]]] = {}
 BUFFER_MAX_PER_PAIR = 50
@@ -113,7 +112,7 @@ def register_user(
     avatar: Optional[str] = None,
     passkey: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
-    """Register a new user account directly on external PHP server."""
+    """Register a new user account directly on single external PHP database."""
     username = username.strip().lower()
     password = password.strip()
 
@@ -138,14 +137,13 @@ def register_user(
     if resp.get("status") == "ok":
         user = resp.get("user")
         token = resp.get("token")
-        if token and user:
-            _SESSION_CACHE[token] = (user, time.time())
         return user, token, None
+
     return None, None, resp.get("message") or "Registration failed."
 
 
 def authenticate_user(username: str, password: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str]]:
-    """Verify user credentials directly on external PHP server."""
+    """Verify user credentials directly on the single external PHP database."""
     username = username.strip().lower()
     password = password.strip()
 
@@ -165,42 +163,27 @@ def authenticate_user(username: str, password: str) -> Tuple[Optional[Dict[str, 
     if resp.get("status") == "ok":
         user = resp.get("user")
         token = resp.get("token")
-        if token and user:
-            _SESSION_CACHE[token] = (user, time.time())
         return user, token, None
+
     return None, None, resp.get("message") or "Invalid credentials."
 
 
 def verify_session_token(token: str) -> Optional[Dict[str, Any]]:
-    """Validate session token with fast in-memory caching and external PHP fallback."""
+    """Validate session token directly with external PHP database (no local caching)."""
     if not token or len(token) < 16:
         return None
 
-    now = time.time()
-    # Check fast cache
-    cached = _SESSION_CACHE.get(token)
-    if cached:
-        user_data, cached_at = cached
-        if now - cached_at < SESSION_CACHE_TTL:
-            return user_data
-
-    # Query external server
     resp = _php_call({"action": "session_verify", "token": token}, method="GET", timeout=10.0)
     if resp and resp.get("status") == "ok" and resp.get("user"):
-        user = resp["user"]
-        _SESSION_CACHE[token] = (user, now)
-        return user
+        return resp["user"]
 
-    # If verification failed or expired, purge cache
-    _SESSION_CACHE.pop(token, None)
     return None
 
 
 def delete_session(token: str) -> bool:
-    """Revoke session on external PHP server and in-memory cache."""
+    """Revoke session on external PHP server."""
     if not token:
         return False
-    _SESSION_CACHE.pop(token, None)
     resp = _php_call({"action": "logout", "token": token}, method="GET", timeout=8.0)
     return bool(resp and resp.get("status") == "ok")
 
@@ -213,10 +196,6 @@ def set_user_passkey(username: str, passkey: str) -> bool:
         return False
 
     resp = _php_call({"action": "set_passkey", "username": username, "passkey": passkey}, method="POST", timeout=10.0)
-    # Invalidate session cache for user so has_passkey updates
-    for tok, (u, _) in list(_SESSION_CACHE.items()):
-        if u.get("username") == username:
-            _SESSION_CACHE.pop(tok, None)
     return bool(resp and resp.get("status") == "ok")
 
 
@@ -242,7 +221,7 @@ def get_user_profile(username: str) -> Optional[Dict[str, Any]]:
 
 
 def update_user_profile(username: str, display_name: Optional[str] = None, avatar: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Update profile on external PHP server and invalidate session cache."""
+    """Update profile directly on external PHP server."""
     username = username.strip().lower()
     payload = {
         "action": "update_profile",
@@ -252,17 +231,12 @@ def update_user_profile(username: str, display_name: Optional[str] = None, avata
     }
     resp = _php_call(payload, method="POST", timeout=12.0)
     if resp and resp.get("status") == "ok" and resp.get("user"):
-        user = resp["user"]
-        # Update session cache
-        for tok, (u, _) in list(_SESSION_CACHE.items()):
-            if u.get("username") == username:
-                _SESSION_CACHE[tok] = (user, time.time())
-        return user
+        return resp["user"]
     return None
 
 
 def get_all_users(current_user: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Get all registered users directly from external PHP server."""
+    """Get all registered users directly from single external PHP database."""
     params = {"action": "get_users"}
     if current_user:
         params["current_user"] = current_user.strip().lower()
@@ -274,39 +248,30 @@ def get_all_users(current_user: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Presence Tracking via External PHP Server & Fast Memory Cache
+# Presence Tracking via External PHP Server (Direct DB Mode)
 # ─────────────────────────────────────────────────────────────
 def update_user_presence(user_key: str, last_seen_str: Optional[str] = None) -> bool:
-    """Sync presence to memory cache and external PHP server."""
+    """Sync presence directly to external PHP server."""
     if not user_key:
         return False
     user_key = user_key.strip().lower()
     if not last_seen_str:
         last_seen_str = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
-    _PRESENCE_CACHE[user_key] = (last_seen_str, time.time())
     resp = _php_call({"action": "presence_update", "user": user_key, "last_seen": last_seen_str}, method="POST", timeout=8.0)
     return bool(resp and resp.get("status") == "ok")
 
 
 def get_user_presence(user_key: str) -> Optional[str]:
-    """Retrieve last seen from memory cache or external PHP server."""
+    """Retrieve last seen directly from external PHP server."""
     if not user_key:
         return None
     user_key = user_key.strip().lower()
 
-    cached = _PRESENCE_CACHE.get(user_key)
-    if cached:
-        last_seen, ts = cached
-        if time.time() - ts < PRESENCE_CACHE_TTL:
-            return last_seen
-
     resp = _php_call({"action": "presence_get", "user": user_key}, method="POST", timeout=8.0)
     if resp and resp.get("status") == "ok" and resp.get("last_seen"):
-        ls = resp["last_seen"]
-        _PRESENCE_CACHE[user_key] = (ls, time.time())
-        return ls
-    return cached[0] if cached else None
+        return resp["last_seen"]
+    return None
 
 
 # ─────────────────────────────────────────────────────────────

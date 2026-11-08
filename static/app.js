@@ -55,6 +55,10 @@ const soundToggleBtn     = document.getElementById('soundToggleBtn');
 const loveBlastBtn       = document.getElementById('loveBlastBtn');
 const clearChatBtn       = document.getElementById('clearChatBtn');
 const lockAppBtn         = document.getElementById('lockAppBtn');
+const grammarCheckToggleBtn = document.getElementById('grammarCheckToggleBtn');
+const grammarBar            = document.getElementById('grammarBar');
+const grammarBarToggleBtn   = document.getElementById('grammarBarToggleBtn');
+const grammarBarStatus      = document.getElementById('grammarBarStatus');
 
 // PIN Lock Overlay elements
 const pinOverlay         = document.getElementById('pinOverlay');
@@ -172,6 +176,7 @@ let lastLocalTextLength = 0;
 
 // Sound
 let soundEnabled = localStorage.getItem('chat_typing_sound') !== 'false';
+let grammarCheckEnabled = localStorage.getItem('chat_grammar_check_enabled') !== 'false';
 let audioCtx     = null;
 let KEYPRESS_AUDIO_BUFFERS = [];
 let audioBuffersLoaded = false;
@@ -182,21 +187,41 @@ const SOUND_FILES = [
   'keypress-005.wav','keypress-006.wav','keypress-007.wav','keypress-008.wav'
 ];
 
-// Helper: authenticated fetch wrapper ensuring Authorization header is attached
+// Helper: authenticated fetch wrapper with strict zero-cache policy
 async function authFetch(url, options = {}) {
   options.headers = options.headers || {};
+  options.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate';
+  options.headers['Pragma'] = 'no-cache';
+  options.headers['Expires'] = '0';
+  options.cache = 'no-store';
+
   const token = localStorage.getItem('chat_session_token');
   if (token) {
     options.headers['Authorization'] = `Bearer ${token}`;
   }
   options.credentials = 'include';
-  return fetch(url, options);
+
+  // Add cache-busting timestamp for GET requests to guarantee fresh load from DB
+  let fetchUrl = url;
+  const method = (options.method || 'GET').toUpperCase();
+  if (method === 'GET') {
+    const sep = fetchUrl.includes('?') ? '&' : '?';
+    fetchUrl = `${fetchUrl}${sep}_t=${Date.now()}`;
+  }
+
+  return fetch(fetchUrl, options);
 }
 
 // ─────────────────────────────────────────────────
 //  Boot & Authentication Lifecycle
 // ─────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
+  // Clear any existing in-memory conversation cache so DB is always queried
+  conversationMessagesCache.clear();
+  if ('caches' in window) {
+    caches.keys().then((keys) => keys.forEach((k) => caches.delete(k)));
+  }
+
   setupPinPad();
   setupPasskeySetupPad();
   setupAuthListeners();
@@ -1887,6 +1912,11 @@ function showOpponentTyping() {
 
 function hideOpponentTyping() {
   opponentTyping = false;
+  clearTimeout(opponentTypingTimer);
+  if (currentLiveIncomingRow) {
+    currentLiveIncomingRow.remove();
+    currentLiveIncomingRow = null;
+  }
   setPresenceUI(isOpponentOnline);
   if (typingIndicator) {
     typingIndicator.classList.remove('active');
@@ -2301,6 +2331,321 @@ function receiveIncomingMessage(text, timeStr, messageId = null, replyTo = null)
 // ─────────────────────────────────────────────────
 //  Send Message
 // ─────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────
+//  Grammar Checking Engine (LanguageTool / NLP)
+// ─────────────────────────────────────────────────
+function updateGrammarCheckUI() {
+  if (grammarCheckToggleBtn) {
+    grammarCheckToggleBtn.classList.toggle('active', grammarCheckEnabled);
+    grammarCheckToggleBtn.title = `Grammar Check: ${grammarCheckEnabled ? 'ON' : 'OFF'} (Click to toggle)`;
+  }
+  if (grammarBar) {
+    grammarBar.classList.toggle('active', grammarCheckEnabled);
+  }
+  if (grammarBarStatus) {
+    grammarBarStatus.textContent = grammarCheckEnabled ? 'ON' : 'OFF';
+  }
+}
+
+let activeGrammarPopover = null;
+
+function closeAllGrammarPopovers() {
+  if (activeGrammarPopover) {
+    activeGrammarPopover.remove();
+    activeGrammarPopover = null;
+  }
+}
+
+// Global dismiss handler: close popover on tap/click outside
+document.addEventListener('click', (e) => {
+  if (activeGrammarPopover && !activeGrammarPopover.contains(e.target) && !e.target.closest('.grammar-inline-ins')) {
+    closeAllGrammarPopovers();
+  }
+});
+
+// Window resize or scroll: keep popover aligned or dismiss
+window.addEventListener('resize', closeAllGrammarPopovers);
+
+function showGrammarExplanation(targetSpan, message, category) {
+  if (!targetSpan) return;
+
+  // Clicking the same word again toggles it closed
+  if (activeGrammarPopover && activeGrammarPopover.__target === targetSpan) {
+    closeAllGrammarPopovers();
+    return;
+  }
+
+  closeAllGrammarPopovers();
+
+  const popover = document.createElement('div');
+  popover.className = 'grammar-explanation-popover';
+  popover.__target = targetSpan;
+
+  const categoryMap = {
+    'TENSE': 'কাল / Tense',
+    'SPELLING': 'বানান / Spelling',
+    'AGREEMENT': 'Subject-Verb মিল',
+    'PUNCTUATION': 'বিরামচিহ্ন / Punctuation',
+    'WORD_CHOICE': 'শব্দ নির্বাচন',
+    'ARTICLES': 'Article',
+    'PREPOSITIONS': 'Preposition',
+    'HYPHENATION': 'Hyphen',
+    'OTHER': 'ব্যাকরণ / Grammar'
+  };
+  const catKey = (category || '').trim().toUpperCase();
+  const catLabel = categoryMap[catKey] || (category || 'ব্যাকরণ').replace(/_/g, ' ');
+
+  popover.innerHTML = `
+    <div class="grammar-popover-header">
+      <div class="grammar-popover-tag">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="12" y1="16" x2="12" y2="12"></line>
+          <line x1="12" y1="8" x2="12.01" y2="8"></line>
+        </svg>
+        <span>${escapeHtml(catLabel)}</span>
+      </div>
+      <button type="button" class="grammar-popover-close" aria-label="Close">✕</button>
+    </div>
+    <div class="grammar-popover-msg">${escapeHtml(message || 'ব্যাকরণের ব্যাখ্যা')}</div>
+  `;
+
+  document.body.appendChild(popover);
+  activeGrammarPopover = popover;
+
+  const rect = targetSpan.getBoundingClientRect();
+  const popoverRect = popover.getBoundingClientRect();
+
+  // Position above the green word by default
+  let top = rect.top - 10;
+  let isBelow = false;
+  if (top - popoverRect.height < 10) {
+    top = rect.bottom + 10;
+    isBelow = true;
+    popover.classList.add('popover-arrow-top');
+  } else {
+    popover.classList.add('popover-arrow-bottom');
+  }
+
+  let left = rect.left + (rect.width / 2);
+  const margin = 14;
+  const halfWidth = popoverRect.width / 2;
+  if (left - halfWidth < margin) {
+    left = margin + halfWidth;
+  } else if (left + halfWidth > window.innerWidth - margin) {
+    left = window.innerWidth - margin - halfWidth;
+  }
+
+  popover.style.top = `${top}px`;
+  popover.style.left = `${left}px`;
+  popover.style.transform = isBelow ? 'translate(-50%, 0)' : 'translate(-50%, -100%)';
+
+  const closeBtn = popover.querySelector('.grammar-popover-close');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      closeAllGrammarPopovers();
+    });
+  }
+
+  requestAnimationFrame(() => {
+    popover.classList.add('show');
+  });
+}
+
+function buildGrammarDiffHtml(originalText, correctedText, corrections) {
+  if (!originalText) return '';
+  if (!corrections || !corrections.length) return escapeHtml(originalText);
+
+  const matches = [];
+  const origLower = originalText.toLowerCase();
+
+  for (const c of corrections) {
+    const mistake = (c.mistake || '').trim();
+    if (!mistake) continue;
+
+    const mLower = mistake.toLowerCase();
+    let idx = origLower.indexOf(mLower);
+    if (idx === -1) {
+      const stripped = mLower.replace(/^[.,!?;:"'()]+|[.,!?;:"'()]+$/g, '');
+      if (stripped) {
+        idx = origLower.indexOf(stripped);
+      }
+    }
+
+    if (idx !== -1) {
+      matches.push({
+        index: idx,
+        length: mistake.length,
+        mistake: originalText.slice(idx, idx + mistake.length),
+        correction: c.correction || '',
+        message: c.message || 'Grammar correction',
+        category: c.category || 'GRAMMAR'
+      });
+    }
+  }
+
+  matches.sort((a, b) => a.index - b.index);
+
+  let cursor = 0;
+  let html = '';
+
+  for (const m of matches) {
+    if (m.index < cursor) {
+      continue;
+    }
+
+    html += escapeHtml(originalText.slice(cursor, m.index));
+
+    const cleanM = m.mistake.trim().toLowerCase().replace(/[.,!?;:]/g, '');
+    const cleanC = m.correction.trim().toLowerCase().replace(/[.,!?;:]/g, '');
+
+    if (cleanM === cleanC && cleanM !== '') {
+      html += escapeHtml(m.correction);
+    } else {
+      const safeMsg = escapeHtml(m.message).replace(/"/g, '&quot;');
+      const safeCat = escapeHtml(m.category).replace(/"/g, '&quot;');
+      const safeMistake = escapeHtml(m.mistake);
+      const safeCorrection = escapeHtml(m.correction);
+
+      html += `<del class="grammar-inline-del">${safeMistake}</del> <span class="grammar-inline-ins" data-msg="${safeMsg}" data-cat="${safeCat}" role="button" tabindex="0" title="Click to view explanation">${safeCorrection}</span>`;
+    }
+
+    cursor = m.index + m.length;
+  }
+
+  html += escapeHtml(originalText.slice(cursor));
+
+  if (correctedText && /[.!?]$/.test(correctedText) && !/[.!?]$/.test(html.trim())) {
+    const endPunct = correctedText.trim().slice(-1);
+    html += endPunct;
+  }
+
+  return html;
+}
+
+function toggleGrammarCheck() {
+  grammarCheckEnabled = !grammarCheckEnabled;
+  localStorage.setItem('chat_grammar_check_enabled', grammarCheckEnabled);
+  updateGrammarCheckUI();
+  showToast(grammarCheckEnabled ? 'Grammar Check enabled ✨' : 'Grammar Check disabled', 'info');
+
+  if (!grammarCheckEnabled) {
+    closeAllGrammarPopovers();
+    document.querySelectorAll('.grammar-correction-bubble').forEach(b => b.remove());
+  }
+}
+
+const pendingGrammarChecks = new Set();
+
+async function checkAndShowMessageGrammar(messageId, text, type = 'outgoing', timeStr = null, autoOpenExplanation = false) {
+  if (!text) return;
+  const trimmed = text.trim();
+  // Rate-limit safeguard: skip short trivial words, pure links, or emojis
+  if (trimmed.length < 3 || /^https?:\/\//i.test(trimmed) || (typeof isOnlyEmojis === 'function' && isOnlyEmojis(trimmed))) {
+    if (autoOpenExplanation) {
+      showToast('খুব ছোট টেক্সট বা ইমোজির জন্য ব্যাকরণ পরীক্ষা প্রযোজ্য নয়', 'info');
+    }
+    return;
+  }
+
+  if (messageId && pendingGrammarChecks.has(messageId)) return;
+  if (messageId) pendingGrammarChecks.add(messageId);
+
+  const row = document.querySelector(`.message-row[data-msg-id="${messageId}"]`);
+  const bubbleGroup = row ? row.querySelector('.bubble-group') : null;
+  const originalBubble = bubbleGroup ? bubbleGroup.querySelector('.bubble:not(.grammar-correction-bubble)') : null;
+
+  if (autoOpenExplanation && originalBubble) {
+    originalBubble.classList.add('grammar-checking-pulse');
+  }
+
+  try {
+    const res = await fetch('/api/grammar/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    });
+    const data = await res.json();
+
+    if (originalBubble) {
+      originalBubble.classList.remove('grammar-checking-pulse');
+    }
+
+    if (!data || data.status !== 'ok') {
+      return;
+    }
+
+    // If text has no mistakes, do not render a correction bubble
+    if (!data.has_mistakes || !data.corrections || data.corrections.length === 0) {
+      if (autoOpenExplanation) {
+        showToast('এই বাক্যে কোনো ব্যাকরণগত ভুল পাওয়া যায়নি ✨', 'info');
+      }
+      return;
+    }
+
+    if (!row || !bubbleGroup) return;
+
+    // Prevent duplicate correction bubbles or old cards
+    const existingBubble = bubbleGroup.querySelector('.grammar-correction-bubble, .message-grammar-card');
+    if (existingBubble) {
+      existingBubble.remove();
+    }
+
+    const isOutgoing = type === 'outgoing' || row.classList.contains('outgoing');
+    const diffHtml = buildGrammarDiffHtml(data.original || text, data.corrected, data.corrections);
+
+    const bubble = document.createElement('div');
+    bubble.className = `bubble grammar-correction-bubble ${isOutgoing ? 'outgoing-correction' : 'incoming-correction'}`;
+
+    const timeText = timeStr || formatCurrentTime();
+    const metaHtml = isOutgoing
+      ? `<span class="grammar-bubble-meta"><span class="grammar-bubble-time">${timeText}</span><span class="grammar-bubble-ticks">✓✓</span></span>`
+      : `<span class="grammar-bubble-meta"><span class="grammar-bubble-time">${timeText}</span></span>`;
+
+    bubble.innerHTML = `${diffHtml}${metaHtml}`;
+
+    // Attach click listeners to all green corrected words to show explanation
+    bubble.querySelectorAll('.grammar-inline-ins').forEach((ins) => {
+      ins.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const msg = ins.getAttribute('data-msg') || 'Grammar correction';
+        const cat = ins.getAttribute('data-cat') || 'Grammar';
+        showGrammarExplanation(ins, msg, cat);
+      });
+      ins.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          ins.click();
+        }
+      });
+    });
+
+    bubbleGroup.appendChild(bubble);
+    scrollToBottom();
+
+    // If clicked by user, immediately pop open the Bangla explanation for the first mistake
+    if (autoOpenExplanation) {
+      const firstIns = bubble.querySelector('.grammar-inline-ins');
+      if (firstIns) {
+        const msg = firstIns.getAttribute('data-msg') || 'Grammar correction';
+        const cat = firstIns.getAttribute('data-cat') || 'Grammar';
+        setTimeout(() => {
+          showGrammarExplanation(firstIns, msg, cat);
+        }, 120);
+      }
+    }
+  } catch (err) {
+    console.warn('[Grammar] check failed:', err);
+    if (originalBubble) {
+      originalBubble.classList.remove('grammar-checking-pulse');
+    }
+  } finally {
+    if (messageId) pendingGrammarChecks.delete(messageId);
+  }
+}
+
 function handleSend() {
   const text = chatInput.value.trim();
   if (!text) return;
@@ -2314,7 +2659,7 @@ function handleSend() {
   chatInput.value = '';
   lastLocalTextLength = 0;
   chatInput.dispatchEvent(new Event('input'));
-  emojiPopover.classList.remove('show');
+  if (emojiPopover) emojiPopover.classList.remove('show');
 
   // Retain focus so virtual keyboard does not close
   keepInputFocused();
@@ -2336,6 +2681,11 @@ function handleSend() {
 
   // Automatically trigger emoji balloon animation if couple keywords are present
   triggerKeywordEmojiAnimations(text, true);
+
+  // If Grammar Check is enabled, analyze the sent message
+  if (grammarCheckEnabled && text) {
+    checkAndShowMessageGrammar(msgId, text, 'outgoing', clientTime);
+  }
 }
 
 // ─────────────────────────────────────────────────
@@ -3218,32 +3568,11 @@ function resetRecordingUI() {
 
 function updateActionBtnState() {
   if (!actionBtn || !actionIcon) return;
-
-  if (isRecording) {
-    actionBtn.classList.add('recording-active');
-    actionBtn.classList.remove('mic-mode', 'send-mode');
-    actionBtn.title = 'Send Voice Note';
-    actionBtn.setAttribute('aria-label', 'Send Voice Note');
-    actionIcon.innerHTML = SEND_ICON_SVG;
-    return;
-  }
-
-  actionBtn.classList.remove('recording-active');
-  const hasText = chatInput && chatInput.value.trim().length > 0;
-
-  if (hasText) {
-    actionBtn.classList.add('send-mode');
-    actionBtn.classList.remove('mic-mode');
-    actionBtn.title = 'Send';
-    actionBtn.setAttribute('aria-label', 'Send message');
-    actionIcon.innerHTML = SEND_ICON_SVG;
-  } else {
-    actionBtn.classList.add('mic-mode');
-    actionBtn.classList.remove('send-mode');
-    actionBtn.title = 'Record Voice';
-    actionBtn.setAttribute('aria-label', 'Record voice message');
-    actionIcon.innerHTML = MIC_ICON_SVG;
-  }
+  actionBtn.classList.remove('recording-active', 'mic-mode');
+  actionBtn.classList.add('send-mode');
+  actionBtn.title = 'Send';
+  actionBtn.setAttribute('aria-label', 'Send message');
+  actionIcon.innerHTML = SEND_ICON_SVG;
 }
 
 // ─────────────────────────────────────────────────
@@ -3402,11 +3731,12 @@ function setupEventListeners() {
     // Stream keystrokes live to opponent before message is sent
     if (rawVal.length > 0) {
       wsSend({ type: 'live_typing', text: rawVal });
+      wsSend({ type: 'typing_start' });
       clearTimeout(typingOutTimer);
       typingOutTimer = setTimeout(() => {
         wsSend({ type: 'live_typing', text: '' });
         wsSend({ type: 'typing_stop' });
-      }, 5000);
+      }, 4000);
     } else {
       clearTimeout(typingOutTimer);
       wsSend({ type: 'live_typing', text: '' });
@@ -3459,13 +3789,10 @@ function setupEventListeners() {
 
   function handleActionBtnTrigger() {
     markMessageInteraction();
-    if (isRecording) {
-      stopAndSendVoiceRecording();
-      chatInput.focus({ preventScroll: true });
-    } else if (chatInput.value.trim()) {
+    if (chatInput && chatInput.value.trim()) {
       executeSend();
-    } else {
-      startVoiceRecording();
+    } else if (chatInput) {
+      chatInput.focus({ preventScroll: true });
     }
   }
 
@@ -3539,6 +3866,21 @@ function setupEventListeners() {
 
     chatBackBtn.addEventListener('click', handleBackClick);
   }
+
+  // Grammar Check Toggle Buttons
+  if (grammarCheckToggleBtn) {
+    grammarCheckToggleBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleGrammarCheck();
+    });
+  }
+  if (grammarBarToggleBtn) {
+    grammarBarToggleBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleGrammarCheck();
+    });
+  }
+  updateGrammarCheckUI();
 
   // Lock app (from conversation or chats screen)
   if (lockAppBtn) lockAppBtn.addEventListener('click', lockApp);
@@ -3729,7 +4071,7 @@ function setupEventListeners() {
           e.preventDefault();
           e.stopPropagation();
         }
-        emojiPopover.classList.remove('show');
+        if (emojiPopover) emojiPopover.classList.remove('show');
         if (imageFileInput) {
           imageFileInput.click();
         }
@@ -3741,33 +4083,38 @@ function setupEventListeners() {
     document.addEventListener('click', (e) => {
       if (!e.target.closest('#emojiPopover') && !e.target.closest('#emojiBtn')) {
         if (Date.now() - lastEmojiBtnTouchTime < 400) return;
-        emojiPopover.classList.remove('show');
+        if (emojiPopover) emojiPopover.classList.remove('show');
       }
     });
     document.addEventListener('touchend', (e) => {
       if (!e.target.closest('#emojiPopover') && !e.target.closest('#emojiBtn')) {
         if (Date.now() - lastEmojiBtnTouchTime < 400) return;
-        emojiPopover.classList.remove('show');
+        if (emojiPopover) emojiPopover.classList.remove('show');
       }
     });
   }
 
-  // ── Click Message to Toggle Timestamp ──
-  // Show message time only when clicking the message, otherwise hide it.
-  // Clicking outside messages dismisses any open timestamp.
+  // ── Click Message to Toggle Timestamp & Show Bangla Grammar Explanation ──
   if (chatMessages) {
     chatMessages.addEventListener('click', (e) => {
-      const row = e.target.closest('.message-row');
-      if (!row) {
-        // Clicked outside messages (chat background): dismiss all open timestamps
-        document.querySelectorAll('.message-row.show-time').forEach(el => el.classList.remove('show-time'));
+      // Ignore clicks inside popovers or on interactive controls
+      if (e.target.closest('.grammar-explanation-popover') || e.target.closest('.grammar-inline-ins')) {
         return;
       }
 
-      // Ignore clicks on specific interactive controls (voice play/seek, photo preview)
+      const row = e.target.closest('.message-row');
+      if (!row) {
+        // Clicked outside messages (chat background): dismiss all open timestamps and popovers
+        document.querySelectorAll('.message-row.show-time').forEach(el => el.classList.remove('show-time'));
+        closeAllGrammarPopovers();
+        return;
+      }
+
+      // Ignore clicks on specific interactive controls (voice play/seek, photo preview, reply quotes)
       if (e.target.closest('.voice-play-btn') || 
           e.target.closest('.voice-waveform') || 
-          e.target.closest('.chat-image-preview')) {
+          e.target.closest('.chat-image-preview') ||
+          e.target.closest('.reply-quote-chip')) {
         return;
       }
 
@@ -3784,6 +4131,37 @@ function setupEventListeners() {
       // Keep input focused if it was active
       if (document.activeElement === chatInput) {
         keepInputFocused();
+      }
+
+      // ── CLICK ON ANY MESSAGE TO SHOW BANGLA GRAMMAR EXPLANATION ──
+      const bubbleGroup = row.querySelector('.bubble-group');
+      const existingCorrectionBubble = bubbleGroup ? bubbleGroup.querySelector('.grammar-correction-bubble') : null;
+
+      if (existingCorrectionBubble) {
+        // Already analyzed: toggle the Bangla explanation popover
+        const firstIns = existingCorrectionBubble.querySelector('.grammar-inline-ins');
+        if (firstIns) {
+          if (activeGrammarPopover && activeGrammarPopover.__target === firstIns) {
+            closeAllGrammarPopovers();
+          } else {
+            const msg = firstIns.getAttribute('data-msg') || 'Grammar correction';
+            const cat = firstIns.getAttribute('data-cat') || 'Grammar';
+            showGrammarExplanation(firstIns, msg, cat);
+          }
+        }
+      } else {
+        // Not analyzed yet (e.g. past history message or incoming message):
+        // Trigger on-demand check for this single message and auto-open Bangla explanation!
+        const textSpan = row.querySelector('.bubble-text-content');
+        const msgId = row.dataset.msgId;
+        const msgText = textSpan ? textSpan.textContent : '';
+
+        if (msgId && msgText && msgText.trim().length >= 3) {
+          const isOutgoing = row.classList.contains('outgoing');
+          const timeEl = row.querySelector('.message-time');
+          const timeStr = timeEl ? timeEl.textContent : null;
+          checkAndShowMessageGrammar(msgId, msgText, isOutgoing ? 'outgoing' : 'incoming', timeStr, true);
+        }
       }
     });
   }
@@ -4174,6 +4552,7 @@ function findTriggerEmojisForText(text) {
 let lastAutoTriggerTime = 0;
 
 function triggerKeywordEmojiAnimations(text, broadcast = true) {
+  return; // Disabled: Clean text mode only
   const emojis = findTriggerEmojisForText(text);
   if (emojis.length === 0) return;
 
@@ -4230,6 +4609,7 @@ const COMPANION_EMOJIS = {
 const TRAJECTORY_STYLES = ['fly-wave-a', 'fly-wave-b', 'fly-spiral', 'fly-burst'];
 
 function createFlyingBalloon(emojiChar) {
+  return; // Disabled: Clean text mode only
   if (!emojiChar) return;
   const container = getBalloonsContainer();
 

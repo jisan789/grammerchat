@@ -40,6 +40,7 @@ from app.async_utils import run_in_thread
 from app.routers import auth as auth_router
 from app.routers import users as users_router
 from app.routers import messages as messages_router
+from app.routers import grammar as grammar_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -66,23 +67,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enforce strict 1-hour maximum cache lifetime for scripts, styles, and images to serve live data
+# Strict Zero-Cache Middleware: Forces browser and proxies to NEVER cache HTML, JS, CSS, or API data
 @app.middleware("http")
-async def enforce_one_hour_cache_limit(request: Request, call_next):
+async def block_all_caching_middleware(request: Request, call_next):
     response = await call_next(request)
-    path = request.url.path.lower()
-    is_static_or_media = (
-        path.startswith("/static/") or
-        path.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".webp", ".svg", ".ico", ".webmanifest"))
-    )
-    if is_static_or_media and path != "/sw.js":
-        response.headers["Cache-Control"] = "public, max-age=3600, must-revalidate"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["Surrogate-Control"] = "no-store"
+    # Strip caching validators to prevent 304 Not Modified responses
+    for h in ("ETag", "etag", "Last-Modified", "last-modified"):
+        if h in response.headers:
+            del response.headers[h]
     return response
 
 # Include modular API routers
 app.include_router(auth_router.router)
 app.include_router(users_router.router)
 app.include_router(messages_router.router)
+app.include_router(grammar_router.router)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -301,9 +304,30 @@ async def health():
 
 
 # ─────────────────────────────────────────────────────────────
-# Static Files & SPA Delivery
+# Static Files & SPA Delivery (Strict No-Cache Mode)
 # ─────────────────────────────────────────────────────────────
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
+class NoCacheStaticFiles(StaticFiles):
+    def is_not_modified(self, response_headers, request_headers) -> bool:
+        return False
+
+    def file_response(self, *args, **kwargs) -> Response:
+        resp = super().file_response(*args, **kwargs)
+        for k, v in NO_CACHE_HEADERS.items():
+            resp.headers[k] = v
+        for h in ("ETag", "etag", "Last-Modified", "last-modified"):
+            if h in resp.headers:
+                del resp.headers[h]
+        return resp
+
+
+app.mount("/static", NoCacheStaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/app.js")
@@ -311,7 +335,7 @@ async def serve_app_js():
     return FileResponse(
         str(STATIC_DIR / "app.js"),
         media_type="application/javascript",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        headers=NO_CACHE_HEADERS,
     )
 
 
@@ -320,7 +344,7 @@ async def serve_pwa_js():
     return FileResponse(
         str(STATIC_DIR / "pwa.js"),
         media_type="application/javascript",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        headers=NO_CACHE_HEADERS,
     )
 
 
@@ -329,7 +353,7 @@ async def serve_style_css():
     return FileResponse(
         str(STATIC_DIR / "style.css"),
         media_type="text/css",
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        headers=NO_CACHE_HEADERS,
     )
 
 
@@ -337,19 +361,18 @@ async def serve_style_css():
 async def serve_root():
     return FileResponse(
         str(INDEX_FILE),
-        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        headers=NO_CACHE_HEADERS,
     )
 
 
 @app.get("/sw.js")
 async def serve_sw_js():
+    sw_headers = dict(NO_CACHE_HEADERS)
+    sw_headers["Service-Worker-Allowed"] = "/"
     return FileResponse(
         str(BASE_DIR / "sw.js"),
         media_type="application/javascript",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Service-Worker-Allowed": "/",
-        },
+        headers=sw_headers,
     )
 
 
@@ -359,7 +382,7 @@ async def serve_manifest():
     return FileResponse(
         str(BASE_DIR / "manifest.webmanifest"),
         media_type="application/manifest+json",
-        headers={"Cache-Control": "public, max-age=3600"},
+        headers=NO_CACHE_HEADERS,
     )
 
 
@@ -368,7 +391,7 @@ async def serve_offline_html():
     return FileResponse(
         str(BASE_DIR / "offline.html"),
         media_type="text/html",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers=NO_CACHE_HEADERS,
     )
 
 
@@ -377,7 +400,7 @@ async def serve_favicon():
     return FileResponse(
         str(BASE_DIR / "favicon.ico"),
         media_type="image/x-icon",
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers=NO_CACHE_HEADERS,
     )
 
 

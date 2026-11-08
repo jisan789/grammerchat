@@ -1,7 +1,7 @@
 /**
- * LiveChat — Progressive Web App (PWA) Registration
- * Enables native browser and phone installation in default browser settings
- * without displaying custom in-chat install buttons, banners, or instruction overlays.
+ * LiveChat — PWA & Zero-Cache Maintenance
+ * Maintains standalone UI display mode detection while guaranteeing
+ * all local browser caches and service worker caches are immediately evicted.
  */
 
 (function () {
@@ -28,28 +28,21 @@
     }
   });
 
-  // Register Service Worker for PWA installability & offline fallback
-  if ('serviceWorker' in navigator) {
-    window.addEventListener('load', () => {
-      navigator.serviceWorker
-        .register('/sw.js', { scope: '/' })
-        .then((reg) => {
-          console.log('[PWA] Service Worker registered. Scope:', reg.scope);
+  // Thoroughly clear any browser CacheStorage buckets
+  if ('caches' in window) {
+    caches.keys().then((names) => {
+      names.forEach((name) => caches.delete(name));
+    });
+  }
 
-          reg.addEventListener('updatefound', () => {
-            const newWorker = reg.installing;
-            if (newWorker) {
-              newWorker.addEventListener('statechange', () => {
-                if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                  console.log('[PWA] New version available.');
-                }
-              });
-            }
-          });
-        })
-        .catch((err) => {
-          console.warn('[PWA] Service Worker registration error:', err);
+  // Unregister any active or lingering Service Workers to prevent local caching
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then((registrations) => {
+      for (const registration of registrations) {
+        registration.unregister().then((success) => {
+          if (success) console.log('[PWA] Unregistered service worker to enforce live database updates.');
         });
+      }
     });
   }
 
