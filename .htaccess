@@ -1,0 +1,65 @@
+# ==============================================================================
+# LiveChat — Complete Zero-Cache Enforcer (.htaccess)
+# Completely disables all browser, proxy, and CDN caching so all updates apply instantly.
+# ==============================================================================
+
+# 1. Disable ETags (prevents 304 Not Modified cache validations)
+<IfModule mod_headers.c>
+    Header unset ETag
+    Header unset Last-Modified
+</IfModule>
+FileETag None
+
+# 2. Disable Apache mod_expires so browsers never store assets on disk
+<IfModule mod_expires.c>
+    ExpiresActive Off
+</IfModule>
+
+# 3. Global Anti-Cache Headers across all responses
+<IfModule mod_headers.c>
+    Header always set Cache-Control "no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0"
+    Header always set Pragma "no-cache"
+    Header always set Expires "0"
+    Header always set Surrogate-Control "no-store"
+    Header always set CDN-Cache-Control "no-store"
+    Header always set Cloudflare-CDN-Cache-Control "no-store"
+</IfModule>
+
+# 4. Strict FileMatch for all Web Assets (HTML, JS, CSS, JSON, Manifests, PHP, SVG)
+<FilesMatch "\.(html|htm|js|css|json|webmanifest|php|svg|txt|xml)$">
+    FileETag None
+    <IfModule mod_headers.c>
+        Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0"
+        Header set Pragma "no-cache"
+        Header set Expires "0"
+        Header set Surrogate-Control "no-store"
+        Header set CDN-Cache-Control "no-store"
+        Header set Cloudflare-CDN-Cache-Control "no-store"
+        Header unset ETag
+        Header unset Last-Modified
+    </IfModule>
+</FilesMatch>
+
+# 5. Service Worker script: strictly never cache and allow root scope
+<Files "sw.js">
+    <IfModule mod_headers.c>
+        Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0"
+        Header set Pragma "no-cache"
+        Header set Expires "0"
+        Header set Service-Worker-Allowed "/"
+    </IfModule>
+</Files>
+
+# 6. LiteSpeed Web Server / OpenLiteSpeed cache bypass
+<IfModule LiteSpeed>
+    CacheLookup Off
+</IfModule>
+<IfModule mod_litespeed.c>
+    CacheLookup Off
+</IfModule>
+
+# 7. Protect sensitive database and backend files from direct download
+<FilesMatch "(livechat\.db|livechat\.db-wal|livechat\.db-shm|\.env|\.git.*)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>

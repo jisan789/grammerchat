@@ -1,0 +1,19 @@
+# ==============================================================================
+# LiveChat — Static Assets Zero-Cache Enforcer (.htaccess)
+# ==============================================================================
+
+<IfModule mod_headers.c>
+    Header unset ETag
+    Header unset Last-Modified
+    Header always set Cache-Control "no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0"
+    Header always set Pragma "no-cache"
+    Header always set Expires "0"
+    Header always set Surrogate-Control "no-store"
+    Header always set CDN-Cache-Control "no-store"
+    Header always set Cloudflare-CDN-Cache-Control "no-store"
+</IfModule>
+FileETag None
+
+<IfModule mod_expires.c>
+    ExpiresActive Off
+</IfModule>

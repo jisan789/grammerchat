@@ -4843,3 +4843,10 @@ setInterval(() => {
   }
 }, 20000);
 
+// Ensure pages restored from BFCache immediately fetch fresh updates
+window.addEventListener('pageshow', (event) => {
+  if (event.persisted) {
+    window.location.reload();
+  }
+});
+

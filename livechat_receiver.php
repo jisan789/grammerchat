@@ -13,6 +13,14 @@ header('Access-Control-Allow-Credentials: true');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
 
+// Strict Zero-Cache Headers: Disables proxy, CDN, and browser caching
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0');
+header('Pragma: no-cache');
+header('Expires: 0');
+header('Surrogate-Control: no-store');
+header('CDN-Cache-Control: no-store');
+header('Cloudflare-CDN-Cache-Control: no-store');
+
 // Handle preflight OPTIONS request
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);

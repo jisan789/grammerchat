@@ -75,6 +75,8 @@ async def block_all_caching_middleware(request: Request, call_next):
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     response.headers["Surrogate-Control"] = "no-store"
+    response.headers["CDN-Cache-Control"] = "no-store"
+    response.headers["Cloudflare-CDN-Cache-Control"] = "no-store"
     # Strip caching validators to prevent 304 Not Modified responses
     for h in ("ETag", "etag", "Last-Modified", "last-modified"):
         if h in response.headers:
@@ -310,6 +312,9 @@ NO_CACHE_HEADERS = {
     "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0",
     "Pragma": "no-cache",
     "Expires": "0",
+    "Surrogate-Control": "no-store",
+    "CDN-Cache-Control": "no-store",
+    "Cloudflare-CDN-Cache-Control": "no-store",
 }
 
 
