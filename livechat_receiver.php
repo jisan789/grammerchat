@@ -2,18 +2,20 @@
 /**
  * LiveChat High-Performance SQLite PDO Receiver & API Provider
  * 
- * Upgraded to native SQLite storage (livechat.db) with WAL mode, transactions,
- * prepared statements, session cookie observation, and safe targeted conversation deletion.
+ * Streamlined to strictly required features:
+ * - Direct SQLite (livechat.db) with WAL mode, prepared statements, and transactions.
+ * - Strict zero-cache headers for instant updates.
+ * - User authentication, session management, and 4-digit PIN passkeys.
+ * - Real-time text messaging, reply quotes, delivery/seen status, and user presence.
+ * - Safe targeted conversation clearing (requires both participants).
  */
 
-// 1. Headers & CORS Configuration
+// 1. Headers & Strict Zero-Cache CORS Configuration
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Credentials: true');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
-
-// Strict Zero-Cache Headers: Disables proxy, CDN, and browser caching
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0');
 header('Pragma: no-cache');
 header('Expires: 0');
@@ -27,15 +29,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-// 2. Storage & Directory Configuration
-$dbFile    = __DIR__ . '/livechat.db';
-$voiceDir  = __DIR__ . '/voice';
-$imagesDir = __DIR__ . '/images';
+// 2. Storage & SQLite PDO Initialization
+$dbFile = __DIR__ . '/livechat.db';
 
-if (!is_dir($voiceDir))  @mkdir($voiceDir, 0755, true);
-if (!is_dir($imagesDir)) @mkdir($imagesDir, 0755, true);
-
-// 3. SQLite PDO Initialization
 try {
     $pdo = new PDO('sqlite:' . $dbFile);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -77,9 +73,8 @@ try {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             sender TEXT NOT NULL,
             recipient TEXT NOT NULL,
-            msg_type TEXT NOT NULL,
+            msg_type TEXT NOT NULL DEFAULT 'chat',
             text_content TEXT,
-            media_duration REAL,
             client_time TEXT,
             seen INTEGER DEFAULT 0,
             reply_to TEXT,
@@ -88,67 +83,36 @@ try {
         );
         CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender, recipient);
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+        CREATE INDEX IF NOT EXISTS idx_messages_client_msg_id ON messages(client_msg_id);
     ");
 
-    // 4. Seen records
-    $pdo->exec("
-        CREATE TABLE IF NOT EXISTS seen_records (
-            msg_id TEXT PRIMARY KEY,
-            marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    ");
-
-    // 5. User presence tracking
+    // 4. User presence tracking table
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS user_presence (
             user_key TEXT PRIMARY KEY,
             last_seen TEXT NOT NULL,
-            updated_at TIMESTAMP D  EFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     ");
-    try { $pdo->exec("ALTER TABLE user_presence ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"); } catch (Exception $e) {}
 } catch (Exception $e) {
     http_response_code(500);
-    echo json_encode(['status' => 'error', 'message' => 'SQLite initialization error: ' . $e->getMessage()]);
+    echo json_encode(['status' => 'error', 'message' => 'Database error: ' . $e->getMessage()]);
     exit;
 }
 
 // ─────────────────────────────────────────────────────────────
-// Cookie & Request Helpers
+// Request & Token Helpers
 // ─────────────────────────────────────────────────────────────
-$isHttps = (
-    (!empty($_SERVER['HTTPS']) && strtolower($_SERVER['HTTPS']) !== 'off') ||
-    (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower($_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') ||
-    (!empty($_SERVER['SERVER_PORT']) && $_SERVER['SERVER_PORT'] == 443)
-);
+$method   = $_SERVER['REQUEST_METHOD'];
+$rawInput = file_get_contents('php://input');
+$jsonBody = json_decode($rawInput, true);
+$input    = is_array($jsonBody) ? $jsonBody : $_POST;
 
-function setSessionCookie($token, $isHttps) {
-    $expire = time() + (90 * 86400); // 90 days
-    if (PHP_VERSION_ID >= 70300) {
-        setcookie('chat_session', $token, [
-            'expires'  => $expire,
-            'path'     => '/',
-            'httponly' => true,
-            'samesite' => 'Lax',
-            'secure'   => $isHttps,
-        ]);
-    } else {
-        setcookie('chat_session', $token, $expire, '/; samesite=lax', '', $isHttps, true);
-    }
-}
-
-function clearSessionCookie($isHttps) {
-    if (PHP_VERSION_ID >= 70300) {
-        setcookie('chat_session', '', [
-            'expires'  => time() - 3600,
-            'path'     => '/',
-            'httponly' => true,
-            'samesite' => 'Lax',
-            'secure'   => $isHttps,
-        ]);
-    } else {
-        setcookie('chat_session', '', time() - 3600, '/; samesite=lax', '', $isHttps, true);
-    }
+$action = '';
+if (isset($_GET['action'])) {
+    $action = strtolower(trim($_GET['action']));
+} elseif (isset($input['action'])) {
+    $action = strtolower(trim($input['action']));
 }
 
 function getSessionTokenFromRequest() {
@@ -210,108 +174,11 @@ function getAuthenticatedUser($pdo) {
     ];
 }
 
-// Media upload helpers
-function saveVoiceAudioFile($dataUrlOrBase64) {
-    if (empty($dataUrlOrBase64)) return null;
-    $ext = 'webm';
-    $binary = null;
-
-    if (preg_match('/^data:audio\/([a-zA-Z0-9_\-\+]+)(?:;[a-zA-Z0-9_\-=]+)*;base64,(.+)$/s', $dataUrlOrBase64, $matches)) {
-        $mime = strtolower($matches[1]);
-        if (strpos($mime, 'ogg') !== false)       $ext = 'ogg';
-        elseif (strpos($mime, 'mp4') !== false || strpos($mime, 'm4a') !== false || strpos($mime, 'aac') !== false) $ext = 'm4a';
-        elseif (strpos($mime, 'wav') !== false)   $ext = 'wav';
-        elseif (strpos($mime, 'mp3') !== false)   $ext = 'mp3';
-        else                                      $ext = 'webm';
-        $binary = base64_decode($matches[2]);
-    } else {
-        $decoded = base64_decode($dataUrlOrBase64, true);
-        if ($decoded !== false && strlen($decoded) > 50) {
-            $binary = $decoded;
-            $ext = 'webm';
-        }
-    }
-
-    if (!$binary) return $dataUrlOrBase64;
-
-    $voiceDir = __DIR__ . '/voice';
-    if (!is_dir($voiceDir)) @mkdir($voiceDir, 0755, true);
-
-    $fileName = 'voice_' . time() . '_' . substr(md5(uniqid(mt_rand(), true)), 0, 8) . '.' . $ext;
-    $filePath = $voiceDir . '/' . $fileName;
-
-    if (@file_put_contents($filePath, $binary) !== false) {
-        global $isHttps;
-        $scheme = $isHttps ? 'https' : 'http';
-        $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : (isset($_SERVER['SERVER_NAME']) ? $_SERVER['SERVER_NAME'] : '');
-        $scriptDir = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
-        if ($host) return "{$scheme}://{$host}{$scriptDir}/voice/{$fileName}";
-    }
-    return $dataUrlOrBase64;
-}
-
-function saveImageFile($dataUrlOrBase64) {
-    if (empty($dataUrlOrBase64)) return null;
-    $ext = 'jpg';
-    $binary = null;
-
-    if (preg_match('/^data:image\/([a-zA-Z0-9_\-\+]+)(?:;[a-zA-Z0-9_\-=]+)*;base64,(.+)$/s', $dataUrlOrBase64, $matches)) {
-        $mime = strtolower($matches[1]);
-        if (strpos($mime, 'png') !== false)       $ext = 'png';
-        elseif (strpos($mime, 'webp') !== false)  $ext = 'webp';
-        elseif (strpos($mime, 'gif') !== false)   $ext = 'gif';
-        elseif (strpos($mime, 'svg') !== false)   $ext = 'svg';
-        else                                      $ext = 'jpg';
-        $binary = base64_decode($matches[2]);
-    } else {
-        $decoded = base64_decode($dataUrlOrBase64, true);
-        if ($decoded !== false && strlen($decoded) > 50) {
-            $binary = $decoded;
-            $ext = 'jpg';
-        }
-    }
-
-    if (!$binary) return $dataUrlOrBase64;
-
-    $imagesDir = __DIR__ . '/images';
-    if (!is_dir($imagesDir)) @mkdir($imagesDir, 0755, true);
-
-    $fileName = 'img_' . time() . '_' . substr(md5(uniqid(mt_rand(), true)), 0, 8) . '.' . $ext;
-    $filePath = $imagesDir . '/' . $fileName;
-
-    if (@file_put_contents($filePath, $binary) !== false) {
-        global $isHttps;
-        $scheme = $isHttps ? 'https' : 'http';
-        $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : (isset($_SERVER['SERVER_NAME']) ? $_SERVER['SERVER_NAME'] : '');
-        $scriptDir = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
-        if ($host) return "{$scheme}://{$host}{$scriptDir}/images/{$fileName}";
-    }
-    return $dataUrlOrBase64;
-}
-
 // ─────────────────────────────────────────────────────────────
-// Request Parsing
-// ─────────────────────────────────────────────────────────────
-$method = $_SERVER['REQUEST_METHOD'];
-$rawInput = file_get_contents('php://input');
-$jsonBody = json_decode($rawInput, true);
-
-$action = '';
-if (isset($_GET['action'])) {
-    $action = strtolower(trim($_GET['action']));
-} elseif (is_array($jsonBody) && isset($jsonBody['action'])) {
-    $action = strtolower(trim($jsonBody['action']));
-} elseif (isset($_POST['action'])) {
-    $action = strtolower(trim($_POST['action']));
-}
-
-$input = is_array($jsonBody) ? $jsonBody : $_POST;
-
-// ─────────────────────────────────────────────────────────────
-// 1. AUTHENTICATION & USER MANAGEMENT ACTIONS
+// 1. AUTHENTICATION & USER MANAGEMENT
 // ─────────────────────────────────────────────────────────────
 
-// A. Register User: action = "register"
+// A. Register User
 if ($action === 'register' || $action === 'user_register') {
     $username    = isset($input['username']) ? strtolower(trim($input['username'])) : '';
     $password    = isset($input['password']) ? trim($input['password']) : '';
@@ -319,7 +186,7 @@ if ($action === 'register' || $action === 'user_register') {
     $avatar      = isset($input['avatar']) ? trim($input['avatar']) : '';
     $passHash    = isset($input['password_hash']) ? trim($input['password_hash']) : '';
     $salt        = isset($input['salt']) ? trim($input['salt']) : '';
-    $passkey     = isset($input['passkey']) ? trim($input['passkey']) : null;
+    $passkey     = isset($input['passkey']) ? trim((string)$input['passkey']) : null;
 
     if (empty($username) || strlen($username) < 2) {
         http_response_code(400);
@@ -327,7 +194,6 @@ if ($action === 'register' || $action === 'user_register') {
         exit;
     }
 
-    // Check if user exists
     $checkStmt = $pdo->prepare("SELECT username FROM users WHERE username = :u");
     $checkStmt->execute([':u' => $username]);
     if ($checkStmt->fetch()) {
@@ -356,13 +222,11 @@ if ($action === 'register' || $action === 'user_register') {
         ':pk' => $passkey,
     ]);
 
-    // Create session token & cookie
+    // Create session token (90 days validity)
     $token = bin2hex(random_bytes(32));
     $expiresAt = gmdate('Y-m-d H:i:s', time() + (90 * 86400));
     $insSess = $pdo->prepare("INSERT INTO sessions (token, username, expires_at) VALUES (:t, :u, :e)");
     $insSess->execute([':t' => $token, ':u' => $username, ':e' => $expiresAt]);
-
-    setSessionCookie($token, $isHttps);
 
     // Initial presence
     $pStmt = $pdo->prepare("
@@ -386,7 +250,7 @@ if ($action === 'register' || $action === 'user_register') {
     exit;
 }
 
-// B. Login / Authenticate: action = "authenticate" or "login"
+// B. Login / Authenticate
 if ($action === 'authenticate' || $action === 'login') {
     $username = isset($input['username']) ? strtolower(trim($input['username'])) : '';
     $password = isset($input['password']) ? trim($input['password']) : '';
@@ -401,14 +265,7 @@ if ($action === 'authenticate' || $action === 'login') {
     $stmt->execute([':u' => $username]);
     $user = $stmt->fetch();
 
-    if (!$user) {
-        http_response_code(401);
-        echo json_encode(['status' => 'error', 'message' => 'Invalid username or password']);
-        exit;
-    }
-
-    $computedHash = hash('sha256', $password . $user['salt']);
-    if ($computedHash !== $user['password_hash']) {
+    if (!$user || hash('sha256', $password . $user['salt']) !== $user['password_hash']) {
         http_response_code(401);
         echo json_encode(['status' => 'error', 'message' => 'Invalid username or password']);
         exit;
@@ -418,8 +275,6 @@ if ($action === 'authenticate' || $action === 'login') {
     $expiresAt = gmdate('Y-m-d H:i:s', time() + (90 * 86400));
     $insSess = $pdo->prepare("INSERT INTO sessions (token, username, expires_at) VALUES (:t, :u, :e)");
     $insSess->execute([':t' => $token, ':u' => $username, ':e' => $expiresAt]);
-
-    setSessionCookie($token, $isHttps);
 
     echo json_encode([
         'status'  => 'ok',
@@ -435,7 +290,7 @@ if ($action === 'authenticate' || $action === 'login') {
     exit;
 }
 
-// C. Verify/Get Session: action = "session_verify" or "me"
+// C. Verify Session Token
 if ($action === 'session_verify' || $action === 'me') {
     $user = getAuthenticatedUser($pdo);
     if (!$user) {
@@ -447,19 +302,18 @@ if ($action === 'session_verify' || $action === 'me') {
     exit;
 }
 
-// D. Logout: action = "logout"
+// D. Logout
 if ($action === 'logout' || $action === 'session_delete') {
     $token = getSessionTokenFromRequest();
     if ($token) {
         $del = $pdo->prepare("DELETE FROM sessions WHERE token = :t");
         $del->execute([':t' => $token]);
     }
-    clearSessionCookie($isHttps);
     echo json_encode(['status' => 'ok', 'message' => 'Logged out successfully']);
     exit;
 }
 
-// E. Set Passkey: action = "set_passkey"
+// E. Set 4-digit Passcode PIN
 if ($action === 'set_passkey') {
     $user = getAuthenticatedUser($pdo);
     $username = $user ? $user['username'] : (isset($input['username']) ? strtolower(trim($input['username'])) : '');
@@ -477,7 +331,7 @@ if ($action === 'set_passkey') {
     exit;
 }
 
-// F. Verify Passkey: action = "verify_passkey"
+// F. Verify 4-digit Passcode PIN
 if ($action === 'verify_passkey') {
     $username = isset($input['username']) ? strtolower(trim($input['username'])) : '';
     $passkey = isset($input['passkey']) ? trim((string)$input['passkey']) : '';
@@ -503,9 +357,9 @@ if ($action === 'verify_passkey') {
     exit;
 }
 
-// G. List Registered Users: action = "get_users"
+// G. List Registered Users
 if ($action === 'get_users') {
-    $currentUser = isset($_GET['current_user']) ? strtolower(trim($_GET['current_user'])) : '';
+    $currentUser = isset($_GET['current_user']) ? strtolower(trim($_GET['current_user'])) : (isset($input['current_user']) ? strtolower(trim($input['current_user'])) : '');
     $stmt = $pdo->query("
         SELECT u.username, u.display_name, u.avatar, u.passkey, p.last_seen
         FROM users u
@@ -528,7 +382,7 @@ if ($action === 'get_users') {
 
         if ($currentUser && $uname !== $currentUser) {
             $mStmt = $pdo->prepare("
-                SELECT id, sender, recipient, msg_type, text_content, media_duration, client_time, seen, created_at
+                SELECT id, sender, recipient, msg_type, text_content, client_time, seen, created_at
                 FROM messages
                 WHERE (sender = :c AND recipient = :u) OR (sender = :u AND recipient = :c)
                 ORDER BY id DESC LIMIT 1
@@ -547,7 +401,7 @@ if ($action === 'get_users') {
     exit;
 }
 
-// H. Update Profile: action = "update_profile"
+// H. Update Profile (Display Name & Avatar)
 if ($action === 'update_profile') {
     $authUser = getAuthenticatedUser($pdo);
     $username = $authUser ? $authUser['username'] : (isset($input['username']) ? strtolower(trim($input['username'])) : '');
@@ -578,34 +432,24 @@ if ($action === 'update_profile') {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 2. CLEAR: SAFE TARGETED CONVERSATION DELETION
-// CRITICAL: Protect against clearing the entire database!
+// 2. CONVERSATION MANAGEMENT & MESSAGING
 // ─────────────────────────────────────────────────────────────
+
+// A. Clear Conversation (Strictly requires both participants)
 if ($action === 'clear' || $action === 'empty') {
     $authUser = getAuthenticatedUser($pdo);
     $u1 = $authUser ? $authUser['username'] : (isset($input['user1']) ? strtolower(trim($input['user1'])) : (isset($_GET['user1']) ? strtolower(trim($_GET['user1'])) : ''));
     $u2 = isset($input['opponent']) ? strtolower(trim($input['opponent'])) : (isset($input['user2']) ? strtolower(trim($input['user2'])) : (isset($_GET['opponent']) ? strtolower(trim($_GET['opponent'])) : (isset($_GET['user2']) ? strtolower(trim($_GET['user2'])) : '')));
 
-    // Strictly enforce both participants to prevent accidental or malicious full wipe
     if (empty($u1) || empty($u2)) {
         http_response_code(400);
         echo json_encode([
-            'status' => 'error',
-            'message' => 'Both conversation participants must be specified to delete chat. Database wipe prevented.'
+            'status'  => 'error',
+            'message' => 'Both participants must be specified to delete chat.'
         ]);
         exit;
     }
 
-    // Find media files associated ONLY with this specific conversation
-    $mediaStmt = $pdo->prepare("
-        SELECT text_content, msg_type FROM messages
-        WHERE ((sender = :u1 AND recipient = :u2) OR (sender = :u2 AND recipient = :u1))
-          AND msg_type IN ('voice', 'image')
-    ");
-    $mediaStmt->execute([':u1' => $u1, ':u2' => $u2]);
-    $mediaRows = $mediaStmt->fetchAll();
-
-    // Delete ONLY the messages between these two users
     $delStmt = $pdo->prepare("
         DELETE FROM messages
         WHERE (sender = :u1 AND recipient = :u2) OR (sender = :u2 AND recipient = :u1)
@@ -613,42 +457,25 @@ if ($action === 'clear' || $action === 'empty') {
     $delStmt->execute([':u1' => $u1, ':u2' => $u2]);
     $deletedCount = $delStmt->rowCount();
 
-    // Clean up local media files belonging ONLY to the deleted messages
-    foreach ($mediaRows as $row) {
-        $content = isset($row['text_content']) ? $row['text_content'] : '';
-        if (strpos($content, '/voice/') !== false) {
-            $parts = explode('/voice/', $content);
-            $fileName = explode('?', end($parts))[0];
-            $filePath = $voiceDir . '/' . $fileName;
-            if (is_file($filePath)) @unlink($filePath);
-        } elseif (strpos($content, '/images/') !== false) {
-            $parts = explode('/images/', $content);
-            $fileName = explode('?', end($parts))[0];
-            $filePath = $imagesDir . '/' . $fileName;
-            if (is_file($filePath)) @unlink($filePath);
-        }
-    }
-
     echo json_encode([
         'status'        => 'ok',
         'message'       => "Cleared {$deletedCount} messages between {$u1} and {$u2}",
         'deleted_count' => $deletedCount
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    ]);
     exit;
 }
 
-// ─────────────────────────────────────────────────────────────
-// 3. GET: Retrieve messages & presence between two users
-// ─────────────────────────────────────────────────────────────
+// B. Retrieve Messages between two users
 if ($action === 'get' || ($method === 'GET' && (empty($action) || $action === 'get'))) {
     $authUser = getAuthenticatedUser($pdo);
     $user1 = isset($_GET['user1']) ? strtolower(trim($_GET['user1'])) : ($authUser ? $authUser['username'] : '');
     $user2 = isset($_GET['user2']) ? strtolower(trim($_GET['user2'])) : (isset($_GET['opponent']) ? strtolower(trim($_GET['opponent'])) : '');
 
+    $conversation = [];
     if ($user1 && $user2) {
         $stmt = $pdo->prepare("
             SELECT * FROM (
-                SELECT id, sender, recipient, msg_type, text_content, media_duration,
+                SELECT id, sender, recipient, msg_type, text_content,
                        client_time, seen, reply_to, client_msg_id, created_at
                 FROM messages
                 WHERE (sender = :u1 AND recipient = :u2) OR (sender = :u2 AND recipient = :u1)
@@ -657,7 +484,6 @@ if ($action === 'get' || ($method === 'GET' && (empty($action) || $action === 'g
         ");
         $stmt->execute([':u1' => $user1, ':u2' => $user2]);
         $rows = $stmt->fetchAll();
-        $conversation = [];
         foreach ($rows as $r) {
             $r['seen'] = (bool)$r['seen'];
             if (!empty($r['reply_to'])) {
@@ -666,11 +492,8 @@ if ($action === 'get' || ($method === 'GET' && (empty($action) || $action === 'g
             }
             $conversation[] = $r;
         }
-    } else {
-        $conversation = [];
     }
 
-    // Get presence for user2
     $lastSeen = null;
     if ($user2) {
         $pStmt = $pdo->prepare("SELECT last_seen FROM user_presence WHERE user_key = :u");
@@ -684,13 +507,11 @@ if ($action === 'get' || ($method === 'GET' && (empty($action) || $action === 'g
         'count'    => count($conversation),
         'messages' => $conversation,
         'last_seen'=> $lastSeen
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    ]);
     exit;
 }
 
-// ─────────────────────────────────────────────────────────────
-// 4. PRESENCE: Update or Retrieve Presence / Last Seen
-// ─────────────────────────────────────────────────────────────
+// C. Update Presence / Last Seen
 if ($action === 'presence_update' || $action === 'update_presence') {
     $user = isset($input['user']) ? strtolower(trim($input['user'])) : (isset($_GET['user']) ? strtolower(trim($_GET['user'])) : '');
     $lastSeen = isset($input['last_seen']) ? trim($input['last_seen']) : (isset($_GET['last_seen']) ? trim($_GET['last_seen']) : gmdate('Y-m-d\TH:i:s\Z'));
@@ -708,6 +529,7 @@ if ($action === 'presence_update' || $action === 'update_presence') {
     exit;
 }
 
+// D. Get Presence / Last Seen
 if ($action === 'presence_get' || $action === 'get_presence' || $action === 'presence') {
     $user = isset($_GET['user']) ? strtolower(trim($_GET['user'])) : (isset($input['user']) ? strtolower(trim($input['user'])) : '');
     $lastSeen = null;
@@ -721,9 +543,7 @@ if ($action === 'presence_get' || $action === 'get_presence' || $action === 'pre
     exit;
 }
 
-// ─────────────────────────────────────────────────────────────
-// 5. SEEN: Mark message(s) as seen
-// ─────────────────────────────────────────────────────────────
+// E. Mark Messages Seen
 if ($action === 'seen' || $action === 'mark_seen') {
     $sender = isset($input['sender']) ? strtolower(trim($input['sender'])) : '';
     $recipient = isset($input['recipient']) ? strtolower(trim($input['recipient'])) : '';
@@ -742,15 +562,12 @@ if ($action === 'seen' || $action === 'mark_seen') {
     exit;
 }
 
-// ─────────────────────────────────────────────────────────────
-// 6. POST: Save a new message (chat, voice, or image)
-// ─────────────────────────────────────────────────────────────
-if ($method === 'POST') {
+// F. Send / Save New Message (POST or action=send)
+if ($method === 'POST' || $action === 'send') {
     $sender = isset($input['sender']) ? strtolower(trim($input['sender'])) : '';
     $recipient = isset($input['recipient']) ? strtolower(trim($input['recipient'])) : '';
     $msgType = isset($input['msg_type']) ? trim($input['msg_type']) : 'chat';
-    $textContent = isset($input['text_content']) ? $input['text_content'] : (isset($input['text']) ? $input['text'] : (isset($input['audio']) ? $input['audio'] : (isset($input['image']) ? $input['image'] : null)));
-    $mediaDuration = isset($input['media_duration']) ? (float)$input['media_duration'] : (isset($input['duration']) ? (float)$input['duration'] : null);
+    $textContent = isset($input['text_content']) ? $input['text_content'] : (isset($input['text']) ? $input['text'] : '');
     $clientTime = isset($input['client_time']) ? trim($input['client_time']) : (isset($input['time']) ? trim($input['time']) : '');
     $clientMsgId = isset($input['client_msg_id']) ? trim($input['client_msg_id']) : (isset($input['id']) ? trim($input['id']) : null);
     $seen = isset($input['seen']) ? (int)(bool)$input['seen'] : 0;
@@ -762,16 +579,9 @@ if ($method === 'POST') {
         exit;
     }
 
-    if ($msgType === 'voice' && !empty($textContent)) {
-        $textContent = saveVoiceAudioFile($textContent);
-    }
-    if ($msgType === 'image' && !empty($textContent)) {
-        $textContent = saveImageFile($textContent);
-    }
-
     // Deduplicate if this client_msg_id was already persisted
     if (!empty($clientMsgId)) {
-        $existStmt = $pdo->prepare("SELECT id, text_content, media_duration, client_time, seen FROM messages WHERE client_msg_id = :cid AND sender = :s LIMIT 1");
+        $existStmt = $pdo->prepare("SELECT id, text_content, client_time, seen FROM messages WHERE client_msg_id = :cid AND sender = :s LIMIT 1");
         $existStmt->execute([':cid' => $clientMsgId, ':s' => $sender]);
         $existing = $existStmt->fetch();
         if ($existing) {
@@ -784,26 +594,24 @@ if ($method === 'POST') {
                     'recipient'      => $recipient,
                     'msg_type'       => $msgType,
                     'text_content'   => $existing['text_content'],
-                    'media_duration' => $existing['media_duration'],
                     'client_time'    => $existing['client_time'],
                     'client_msg_id'  => $clientMsgId,
                     'seen'           => (bool)$existing['seen'],
                 ]
-            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+            ]);
             exit;
         }
     }
 
     $insStmt = $pdo->prepare("
-        INSERT INTO messages (sender, recipient, msg_type, text_content, media_duration, client_time, seen, reply_to, client_msg_id)
-        VALUES (:s, :r, :m, :t, :d, :ct, :seen, :rp, :cid)
+        INSERT INTO messages (sender, recipient, msg_type, text_content, client_time, seen, reply_to, client_msg_id)
+        VALUES (:s, :r, :m, :t, :ct, :seen, :rp, :cid)
     ");
     $insStmt->execute([
         ':s'    => $sender,
         ':r'    => $recipient,
         ':m'    => $msgType,
         ':t'    => $textContent,
-        ':d'    => $mediaDuration,
         ':ct'   => $clientTime,
         ':seen' => $seen,
         ':rp'   => $replyTo,
@@ -828,11 +636,14 @@ if ($method === 'POST') {
             'recipient'      => $recipient,
             'msg_type'       => $msgType,
             'text_content'   => $textContent,
-            'media_duration' => $mediaDuration,
             'client_time'    => $clientTime,
             'client_msg_id'  => $clientMsgId,
             'seen'           => (bool)$seen,
         ]
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    ]);
     exit;
 }
+
+// Default fallback
+http_response_code(400);
+echo json_encode(['status' => 'error', 'message' => 'Unknown action or method']);
