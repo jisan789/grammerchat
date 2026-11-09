@@ -1655,6 +1655,16 @@ function handleWsMessage(msg) {
       }
       break;
 
+    // ── Chat message edited (e.g. Grammar Auto-Correction) ──
+    case 'chat_edit': {
+      const editMsgId = msg.id || msg.client_msg_id;
+      const newText = msg.text || msg.corrected;
+      if (editMsgId && newText) {
+        applyMessageEdit(editMsgId, newText, msg.corrections, false, msg.original);
+      }
+      break;
+    }
+
     // ── Voice note (Live WebSocket & Multi-Device) ──
     case 'voice': {
       const voiceSrc = msg.audio || msg.text || msg.text_content;
@@ -2498,10 +2508,16 @@ function buildGrammarDiffHtml(originalText, correctedText, corrections) {
 
     html += escapeHtml(originalText.slice(cursor, m.index));
 
-    const cleanM = m.mistake.trim().toLowerCase().replace(/[.,!?;:]/g, '');
-    const cleanC = m.correction.trim().toLowerCase().replace(/[.,!?;:]/g, '');
+    const rawM = m.mistake.trim();
+    const rawC = m.correction.trim();
+    const cleanM = rawM.toLowerCase().replace(/[.,!?;:]/g, '');
+    const cleanC = rawC.toLowerCase().replace(/[.,!?;:]/g, '');
 
-    if (cleanM === cleanC && cleanM !== '') {
+    // Skip diff badges if mistake and correction are identical, or only differ by case/punctuation
+    if (rawM === rawC || (cleanM === cleanC && cleanM !== '')) {
+      html += escapeHtml(m.correction || m.mistake);
+    } else if (cleanM === '' && cleanC === '') {
+      // Pure punctuation spacing (e.g. " ?" -> "?"): render cleanly without diff badges
       html += escapeHtml(m.correction);
     } else {
       const safeMsg = escapeHtml(m.message).replace(/"/g, '&quot;');
@@ -2538,6 +2554,91 @@ function toggleGrammarCheck() {
 }
 
 const pendingGrammarChecks = new Set();
+
+function applyMessageEdit(messageId, correctedText, corrections = [], autoOpenExplanation = false, originalText = null) {
+  if (!messageId || !correctedText) return;
+  const row = document.querySelector(`.message-row[data-msg-id="${messageId}"]`);
+  if (!row) return;
+
+  const bubbleGroup = row.querySelector('.bubble-group');
+  if (bubbleGroup) {
+    const existingBubble = bubbleGroup.querySelector('.grammar-correction-bubble, .message-grammar-card');
+    if (existingBubble) {
+      existingBubble.remove();
+    }
+  }
+
+  const bubble = row.querySelector('.bubble:not(.grammar-correction-bubble)');
+  if (!bubble) return;
+
+  const textSpan = bubble.querySelector('.bubble-text-content');
+  if (!textSpan) return;
+
+  // Store corrections and original text on the row
+  row.__grammarCorrections = corrections || [];
+  row.__correctedText = correctedText;
+  if (originalText) row.__originalText = originalText;
+
+  // Display previous error in red and fix in green directly inside this message bubble!
+  if (corrections && corrections.length > 0) {
+    const orig = originalText || row.__originalText || textSpan.textContent;
+    textSpan.innerHTML = buildGrammarDiffHtml(orig, correctedText, corrections);
+    textSpan.classList.remove('only-emojis', 'only-single-emoji');
+
+    // Attach click listeners to green corrected words to open the Bangla explanation popover
+    textSpan.querySelectorAll('.grammar-inline-ins').forEach((ins) => {
+      ins.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const msg = ins.getAttribute('data-msg') || 'Grammar correction';
+        const cat = ins.getAttribute('data-cat') || 'Grammar';
+        showGrammarExplanation(ins, msg, cat);
+      });
+      ins.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          ins.click();
+        }
+      });
+    });
+  } else {
+    textSpan.innerHTML = renderEmojiHtml(correctedText);
+    if (isOnlyEmojis(correctedText)) {
+      const cnt = getEmojiCount(correctedText);
+      textSpan.classList.add('only-emojis');
+      if (cnt === 1) textSpan.classList.add('only-single-emoji');
+    } else {
+      textSpan.classList.remove('only-emojis', 'only-single-emoji');
+    }
+  }
+
+  // Remove any redundant edited tag since the red/green inline styling indicates correction
+  const oldTag = bubble.querySelector('.msg-edited-tag');
+  if (oldTag) oldTag.remove();
+
+  // Brief visual highlight on the row
+  row.classList.remove('message-highlight-pulse');
+  void row.offsetWidth;
+  row.classList.add('message-highlight-pulse');
+  setTimeout(() => row.classList.remove('message-highlight-pulse'), 1200);
+
+  // If latest message in active chat, update chat list card preview
+  if (lastConversationMessage && (!lastConversationMessage.id || lastConversationMessage.id === messageId)) {
+    lastConversationMessage.text = correctedText;
+    updateChatsListCardUI();
+  }
+
+  // Auto-open explanation popover on the first green correction if requested
+  if (autoOpenExplanation && corrections && corrections.length > 0) {
+    const firstIns = textSpan.querySelector('.grammar-inline-ins');
+    if (firstIns) {
+      const msg = firstIns.getAttribute('data-msg') || 'Grammar correction';
+      const cat = firstIns.getAttribute('data-cat') || 'Grammar';
+      setTimeout(() => {
+        showGrammarExplanation(firstIns, msg, cat);
+      }, 150);
+    }
+  }
+}
 
 async function checkAndShowMessageGrammar(messageId, text, type = 'outgoing', timeStr = null, autoOpenExplanation = false) {
   if (!text) return;
@@ -2577,65 +2678,25 @@ async function checkAndShowMessageGrammar(messageId, text, type = 'outgoing', ti
       return;
     }
 
-    // If text has no mistakes, do not render a correction bubble
-    if (!data.has_mistakes || !data.corrections || data.corrections.length === 0) {
+    // If text has no mistakes or no corrected text, do nothing
+    if (!data.has_mistakes || !data.corrections || data.corrections.length === 0 || !data.corrected) {
       if (autoOpenExplanation) {
         showToast('এই বাক্যে কোনো ব্যাকরণগত ভুল পাওয়া যায়নি ✨', 'info');
       }
       return;
     }
 
-    if (!row || !bubbleGroup) return;
+    // Direct in-place edit on the sent message with red error and green fix (NO NEW MESSAGE ADDED!)
+    applyMessageEdit(messageId, data.corrected, data.corrections, autoOpenExplanation, data.original || text);
 
-    // Prevent duplicate correction bubbles or old cards
-    const existingBubble = bubbleGroup.querySelector('.grammar-correction-bubble, .message-grammar-card');
-    if (existingBubble) {
-      existingBubble.remove();
-    }
-
-    const isOutgoing = type === 'outgoing' || row.classList.contains('outgoing');
-    const diffHtml = buildGrammarDiffHtml(data.original || text, data.corrected, data.corrections);
-
-    const bubble = document.createElement('div');
-    bubble.className = `bubble grammar-correction-bubble ${isOutgoing ? 'outgoing-correction' : 'incoming-correction'}`;
-
-    const timeText = timeStr || formatCurrentTime();
-    const metaHtml = isOutgoing
-      ? `<span class="grammar-bubble-meta"><span class="grammar-bubble-time">${timeText}</span><span class="grammar-bubble-ticks">✓✓</span></span>`
-      : `<span class="grammar-bubble-meta"><span class="grammar-bubble-time">${timeText}</span></span>`;
-
-    bubble.innerHTML = `${diffHtml}${metaHtml}`;
-
-    // Attach click listeners to all green corrected words to show explanation
-    bubble.querySelectorAll('.grammar-inline-ins').forEach((ins) => {
-      ins.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const msg = ins.getAttribute('data-msg') || 'Grammar correction';
-        const cat = ins.getAttribute('data-cat') || 'Grammar';
-        showGrammarExplanation(ins, msg, cat);
-      });
-      ins.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          ins.click();
-        }
-      });
-    });
-
-    bubbleGroup.appendChild(bubble);
-    scrollToBottom();
-
-    // If clicked by user, immediately pop open the Bangla explanation for the first mistake
-    if (autoOpenExplanation) {
-      const firstIns = bubble.querySelector('.grammar-inline-ins');
-      if (firstIns) {
-        const msg = firstIns.getAttribute('data-msg') || 'Grammar correction';
-        const cat = firstIns.getAttribute('data-cat') || 'Grammar';
-        setTimeout(() => {
-          showGrammarExplanation(firstIns, msg, cat);
-        }, 120);
-      }
-    }
+    // Broadcast the edit to recipient and other connected devices
+    wsSend({
+      type: 'chat_edit',
+      id: messageId,
+      text: data.corrected,
+      original: data.original || text,
+      corrections: data.corrections
+    }, true);
   } catch (err) {
     console.warn('[Grammar] check failed:', err);
     if (originalBubble) {
@@ -4134,24 +4195,24 @@ function setupEventListeners() {
       }
 
       // ── CLICK ON ANY MESSAGE TO SHOW BANGLA GRAMMAR EXPLANATION ──
-      const bubbleGroup = row.querySelector('.bubble-group');
-      const existingCorrectionBubble = bubbleGroup ? bubbleGroup.querySelector('.grammar-correction-bubble') : null;
-
-      if (existingCorrectionBubble) {
-        // Already analyzed: toggle the Bangla explanation popover
-        const firstIns = existingCorrectionBubble.querySelector('.grammar-inline-ins');
-        if (firstIns) {
-          if (activeGrammarPopover && activeGrammarPopover.__target === firstIns) {
-            closeAllGrammarPopovers();
-          } else {
-            const msg = firstIns.getAttribute('data-msg') || 'Grammar correction';
-            const cat = firstIns.getAttribute('data-cat') || 'Grammar';
-            showGrammarExplanation(firstIns, msg, cat);
-          }
+      const firstIns = row.querySelector('.grammar-inline-ins');
+      if (firstIns) {
+        if (activeGrammarPopover && activeGrammarPopover.__target === firstIns) {
+          closeAllGrammarPopovers();
+        } else {
+          const msg = firstIns.getAttribute('data-msg') || 'Grammar correction';
+          const cat = firstIns.getAttribute('data-cat') || 'Grammar';
+          showGrammarExplanation(firstIns, msg, cat);
+        }
+      } else if (row.__grammarCorrections && row.__grammarCorrections.length > 0) {
+        const targetTag = row.querySelector('.bubble');
+        if (activeGrammarPopover && activeGrammarPopover.__target === targetTag) {
+          closeAllGrammarPopovers();
+        } else {
+          const first = row.__grammarCorrections[0];
+          showGrammarExplanation(targetTag, first.message || 'Grammar correction', first.category || 'GRAMMAR');
         }
       } else {
-        // Not analyzed yet (e.g. past history message or incoming message):
-        // Trigger on-demand check for this single message and auto-open Bangla explanation!
         const textSpan = row.querySelector('.bubble-text-content');
         const msgId = row.dataset.msgId;
         const msgText = textSpan ? textSpan.textContent : '';

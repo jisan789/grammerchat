@@ -64,7 +64,23 @@ Rules:
    - For subject-verb agreement 'he go' -> 'he goes':
      "'He' হলো Third Person Singular, তাই Present Indefinite Tense-এ মূল verb-এর সাথে 's/es' যোগ হয়ে 'goes' হবে।"
 4. Keep the original voice, meaning, and informal tone if appropriate for chat.
+5. Do NOT flag minor punctuation spacing (e.g. 'doing ?' or ';'). Never flag punctuation if it already exists in the text. Only flag genuine grammatical mistakes, word agreement, and spelling errors.
 """
+
+
+def _sanitize_corrections(corrections: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter out trivial punctuation or identical mistake/correction pairs."""
+    filtered = []
+    for c in corrections:
+        m = (c.get("mistake") or "").strip()
+        r = (c.get("correction") or "").strip()
+        if not m or not r or m == r:
+            continue
+        # Skip if both mistake and correction are purely punctuation
+        if re.sub(r'[\s.,!?;:]', '', m) == '' and re.sub(r'[\s.,!?;:]', '', r) == '':
+            continue
+        filtered.append(c)
+    return filtered
 
 
 def _clean_json_str(raw: str) -> str:
@@ -97,14 +113,16 @@ def _check_groq_ai(cleaned: str) -> Optional[Dict[str, Any]]:
             )
             raw = completion.choices[0].message.content or ""
             data = json.loads(_clean_json_str(raw))
+            corrs = _sanitize_corrections(data.get("corrections") or [])
+            has_mistakes = bool(data.get("has_mistakes") and corrs)
             return {
                 "status": "ok",
                 "engine": f"groq:{GROQ_MODEL}",
                 "original": data.get("original") or cleaned,
                 "corrected": data.get("corrected") or cleaned,
-                "has_mistakes": bool(data.get("has_mistakes") and data.get("corrections")),
-                "mistakes_count": len(data.get("corrections") or []),
-                "corrections": data.get("corrections") or [],
+                "has_mistakes": has_mistakes,
+                "mistakes_count": len(corrs),
+                "corrections": corrs,
             }
         except Exception as exc:
             logger.warning(f"[Grammar] Groq SDK call failed: {exc}")
@@ -132,14 +150,16 @@ def _check_groq_ai(cleaned: str) -> Optional[Dict[str, Any]]:
                 body = resp.json()
                 raw = body["choices"][0]["message"]["content"]
                 data = json.loads(_clean_json_str(raw))
+                corrs = _sanitize_corrections(data.get("corrections") or [])
+                has_mistakes = bool(data.get("has_mistakes") and corrs)
                 return {
                     "status": "ok",
                     "engine": f"groq-http:{GROQ_MODEL}",
                     "original": data.get("original") or cleaned,
                     "corrected": data.get("corrected") or cleaned,
-                    "has_mistakes": bool(data.get("has_mistakes") and data.get("corrections")),
-                    "mistakes_count": len(data.get("corrections") or []),
-                    "corrections": data.get("corrections") or [],
+                    "has_mistakes": has_mistakes,
+                    "mistakes_count": len(corrs),
+                    "corrections": corrs,
                 }
             else:
                 logger.warning(f"[Grammar] Groq HTTP {resp.status_code}: {resp.text}")

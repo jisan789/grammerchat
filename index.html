@@ -28,31 +28,15 @@
   <meta name="msapplication-TileImage" content="/static/icons/icon-192.png">
   <meta name="msapplication-tap-highlight" content="no">
 
-  <link rel="stylesheet" href="static/style.css?v=22.0">
+  <link rel="stylesheet" href="static/style.css?v=28.0">
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=Plus+Jakarta+Sans:ital,wght@0,300..800;1,300..800&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
 
-  <!-- Desktop Ambient Wallpaper Lights -->
-  <div class="desktop-wallpaper-glow desktop-wallpaper-glow--1" aria-hidden="true"></div>
-  <div class="desktop-wallpaper-glow desktop-wallpaper-glow--2" aria-hidden="true"></div>
-  <div class="desktop-wallpaper-glow desktop-wallpaper-glow--3" aria-hidden="true"></div>
-
-  <!-- Main Liquid Glass Chat App Container -->
+  <!-- Main Chat App Container -->
   <div class="chat-app" id="chatApp">
-    
-    <!-- Liquid Glass Specular Inner Rim Layer -->
-    <div class="liquid-glass-rim" aria-hidden="true"></div>
-
-    <!-- Background Subtle Prismatic Lines -->
-    <div class="background-watermark" aria-hidden="true">
-      <svg viewBox="0 0 400 800" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M-60 140 C 140 100, 260 300, 460 220" stroke="rgba(255, 255, 255, 0.45)" stroke-width="1.2" stroke-dasharray="4 6"/>
-        <path d="M-40 460 C 120 540, 280 390, 480 620" stroke="rgba(255, 255, 255, 0.35)" stroke-width="1.2"/>
-        <path d="M120 -60 C 200 190, 60 440, 250 860" stroke="rgba(255, 255, 255, 0.25)" stroke-width="1"/>
-      </svg>
-    </div>
 
     <!-- Chats List Screen (Shown after PIN unlock / login) -->
     <div class="chats-screen" id="chatsScreen">
@@ -252,19 +236,6 @@
               <line x1="18" y1="6" x2="6" y2="18"></line>
               <line x1="6" y1="6" x2="18" y2="18"></line>
             </svg>
-          </button>
-        </div>
-
-        <!-- Grammar Check Option Bar -->
-        <div class="grammar-bar active" id="grammarBar">
-          <div class="grammar-bar-left">
-            <svg class="grammar-sparkle-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
-              <path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"></path>
-            </svg>
-            <span class="grammar-bar-text" id="grammarBarText">Grammar Check: <strong id="grammarBarStatus">ON</strong></span>
-          </div>
-          <button type="button" class="grammar-bar-toggle-pill" id="grammarBarToggleBtn" title="Toggle Grammar Check" aria-label="Toggle Grammar Check">
-            <span class="grammar-toggle-knob"></span>
           </button>
         </div>
 
@@ -570,7 +541,7 @@
     </div>
   </div>
 
-  <script src="static/app.js?v=23.0"></script>
+  <script src="static/app.js?v=28.0"></script>
   <script src="static/pwa.js?v=1.0"></script>
 </body>
 </html>

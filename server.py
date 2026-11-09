@@ -164,7 +164,7 @@ async def websocket_endpoint(websocket: WebSocket, user_key: str):
                 is_delivered = await send_to_user(target_user, data)
 
             # Sync message to sender's OTHER devices (real-time cross-device sync)
-            if target_user and msg_type in ("chat", "voice", "image"):
+            if target_user and msg_type in ("chat", "voice", "image", "chat_edit"):
                 sync_payload = dict(data)
                 sync_payload["self_sync"] = True
                 sync_payload["from"] = user_key
